@@ -373,8 +373,7 @@ class RealRobotDataConfig(DataConfigFactory):
     """Astribot 真机（42 维：腰 4 + 双臂 14 + 双手 24）。
 
     - 输入只读 head 图像（`RealRobotInputs`）；
-    - 前 18 维（腰+双臂）是绝对关节角，训练时转 delta；后 24 维（双手）本身就是
-      绝对位置目标，保持 absolute（`make_bool_mask(18, -24)`）。
+    - 42 维全是绝对关节角，训练不做 delta（`make_bool_mask(-42)`），模型直接输出关节目标。
     """
 
     @override
@@ -388,7 +387,7 @@ class RealRobotDataConfig(DataConfigFactory):
             outputs=[RealRobotOutputs()],
         )
 
-        delta_action_mask = _transforms.make_bool_mask(18, -24)
+        delta_action_mask = _transforms.make_bool_mask(-42)
         data_transforms = data_transforms.push(
             inputs=[_transforms.DeltaActions(delta_action_mask)],
             outputs=[_transforms.AbsoluteActions(delta_action_mask)],

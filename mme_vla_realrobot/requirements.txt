@@ -1,0 +1,6 @@
+# deploy/ 相对 mme_vla_realrobot/pyproject.toml 缺少的直接依赖。
+# 版本与 uv.lock 中已解析的版本一致。
+# websockets：policy_server.py 直接 import；只在 packages/openpi-client 里声明。
+# PyYAML：policy_server.py 的 import yaml；目前只作为 hydra / omegaconf 的传递依赖。
+websockets==15.0.1
+PyYAML==6.0.2

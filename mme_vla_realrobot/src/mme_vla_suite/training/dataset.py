@@ -731,6 +731,6 @@ class RoboMMEDataset(Dataset):
             *EG_FIELDS,
         ]:
             if key not in data:
-                data[key] = None        
+                data[key] = None
 
         return data

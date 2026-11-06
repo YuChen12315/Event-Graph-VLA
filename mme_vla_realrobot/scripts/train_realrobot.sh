@@ -44,6 +44,7 @@ if [ "$MODE" = "pi05" ]; then
       --num-workers=16 \
       --fsdp-devices="$FSDP" \
       --dataset-path="$DATA" \
+      --num-train-steps=40000 \
       --no-wandb-enabled \
       --overwrite
 elif [ "$MODE" = "eg" ]; then

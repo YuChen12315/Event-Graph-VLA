@@ -20,7 +20,6 @@ from mme_vla_suite.models.integration.history_observation import HistAugObservat
 from mme_vla_suite.models.config.utils import get_history_config
 
 
-
 class DataLoaderImpl(DataLoader):
     def __init__(self, data_config: _config.DataConfig, data_loader: TorchDataLoader):
         self._data_config = data_config

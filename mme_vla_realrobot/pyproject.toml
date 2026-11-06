@@ -13,7 +13,7 @@ dependencies = [
     "flatbuffers>=24.3.25",
     "flax==0.10.2",
     "fsspec[gcs]>=2024.6.0",
-    "imageio>=2.36.1",
+    "imageio[ffmpeg]>=2.36.1",
     "jax[cuda12]==0.5.3",
     "jaxtyping==0.2.36",
     "ml_collections==1.0.0",

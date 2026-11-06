@@ -87,7 +87,7 @@ class RealRobotInputs(transforms.DataTransformFn):
 
 @dataclasses.dataclass(frozen=True)
 class RealRobotOutputs(transforms.DataTransformFn):
-    """推理输出：42 维关节目标（前 18 维 delta 已由 AbsoluteActions 还原）。"""
+    """推理输出：42 维绝对关节目标。"""
 
     def __call__(self, data: dict) -> dict:
         return {"actions": np.asarray(data["actions"][:, :REALROBOT_ACTION_DIM])}

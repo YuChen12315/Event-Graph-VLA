@@ -81,7 +81,7 @@ EXTRA="--cpu" bash scripts/run_realrobot_pipeline.sh   # GPU 被占时用 CPU
 只做 π0.5 且数据还没转换时，可以只跑转换 + norm stats，省掉 Event-Graph 步骤：
 
 ```bash
-uv run python scripts/build_realrobot_dataset.py --dataset-path data/realrobot_preprocessed --yes
+uv run python scripts/build_realrobot_dataset.py --raw-root data/path --dataset-path data/realrobot_preprocessed --yes
 uv run python scripts/compute_norm_stats.py --config-name pi05_realrobot \
   --repo-id realrobot --dataset-path data/realrobot_preprocessed
 ```
@@ -96,46 +96,11 @@ uv run python scripts/compute_norm_stats.py --config-name pi05_realrobot \
 [30:42] 右手 12
 ```
 
-训练时前 18 维转 delta，后 24 维保持绝对位置（`make_bool_mask(18, -24)`）。
+42 维全是绝对关节角，训练不做 delta（`make_bool_mask(-42)`），模型直接输出关节目标。
 
 ## 4. 真机客户端接口（两条路线共用）
 
-[examples/realrobot/client.py](examples/realrobot/client.py) 提供 websocket 客户端、
-memory 缓冲和完整的控制循环。只需要实现 `RobotIO` 的四个方法：
 
-```python
-class MyRobot:  # RobotIO
-    def get_head_image(self): ...       # 当前 head RGB，H×W×3，uint8
-    def get_state(self): ...            # 42 维 state
-    def send_action(self, action): ...  # 单步 42 维绝对关节目标
-    def episode_done(self): ...
-```
-
-42 维拼接与拆分用 `build_state()` / `split_action()`。跑一个 episode：
-
-```python
-with RealRobotPolicyClient("127.0.0.1", 8000) as client:
-    run_episode(client, MyRobot(), prompt="count the objects on the table")
-```
-
-数据流（30 Hz）：
-
-```
-robot.get_head_image() / robot.get_state()
-        │
-        ├─ client.add_observation()   # 执行 action 期间累积帧
-        └─ client.act()               # action chunk 用完时：
-              ├─ add_buffer           # 累积帧 → 服务端 memory
-              └─ infer                # 当前帧 → (20,42) actions
-        │
-robot.send_action(action[i])          # 每拍下发一步
-```
-
-每个 episode 先 `client.reset()`；`act()` 返回的 action 已由服务端还原成绝对
-关节目标。默认执行 chunk 的前 16 步、30 Hz。务必在 `with` / `finally` 中关闭
-连接。
-
----
 
 # 第一部分：π0.5 baseline（负责人 A）
 
