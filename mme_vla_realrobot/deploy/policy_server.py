@@ -361,7 +361,7 @@ async def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="DECO WebSocket policy server")
-    parser.add_argument("--model-config", default="/home/main3/yu/Omega_touch/logs/deco_task7/config.yaml")
+    parser.add_argument("--model-config", default="")
     parser.add_argument("--checkpoint", type=str, default="logs/deco_task7/deco_dino_80m_task7_epoch_500_loss_0.014794.pth", help="Stage1 checkpoint path")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
