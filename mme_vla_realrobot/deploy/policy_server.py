@@ -298,7 +298,6 @@ class InferenceServer:
         self.state_channels = yaml_data["state_channels"]
         self.action_channels = yaml_data["action_channels"]
         self.image_channels = yaml_data["image_channels"]
-        # self.tactile_channels = yaml_data["tactile_channels"]
         self.chunk_size = 20
         self.action_dim = 42  # 模型输出维度 (body 18 + 左手 12 + 右手 12)
         self.obs_dim = 42
