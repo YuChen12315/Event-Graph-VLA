@@ -46,6 +46,7 @@ from time import perf_counter
 from typing import Iterable
 
 import cv2
+import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -164,6 +165,73 @@ def _load_norm_stats(checkpoint: str | None, data_config):
     return data_config.norm_stats
 
 
+def _inference_device():
+    """推理设备。没有 GPU 时 π0.5 的 10 步采样不可能到官方的百毫秒级。"""
+    try:
+        gpus = jax.devices("gpu")
+    except RuntimeError:
+        gpus = []
+    if gpus:
+        return gpus[0]
+    return jax.devices()[0]
+
+
+def _storage_summary(model) -> tuple[int, int, dict[str, int]]:
+    numpy_n = 0
+    device_n = 0
+    dtypes: dict[str, int] = {}
+    for leaf in jax.tree.leaves(nnx.state(model)):
+        if isinstance(leaf, np.ndarray):
+            numpy_n += 1
+        elif isinstance(leaf, jax.Array):
+            device_n += 1
+        dtype = getattr(leaf, "dtype", None)
+        if dtype is not None:
+            key = str(dtype)
+            dtypes[key] = dtypes.get(key, 0) + 1
+    return numpy_n, device_n, dtypes
+
+
+def _place_inference_params(model, device):
+    """把权重放到推理设备，浮点参数统一成 bfloat16。
+
+    ``load_pi05_model`` 沿用训练初始化：权重是 numpy，并且只把 ``.*img.*`` 转成
+    bfloat16。``module_jit`` 每次调用都会把这份 state 传进 ``jax.jit``。numpy
+    数组每次都会整模从 CPU 拷到 GPU（几千个小数组，float32 时约十 GB），所以
+    稳态也会落在 1 秒左右。官方 ``create_trained_policy`` 在 restore 时就用
+    ``dtype=bfloat16`` 的 device array，计算走 Tensor Core。
+    """
+    model.eval()
+    graphdef, state = nnx.split(model)
+
+    def _leaf(variable):
+        value = variable.value
+        dtype = getattr(value, "dtype", None)
+        if dtype is None:
+            return variable
+        if jnp.issubdtype(dtype, jnp.floating):
+            value = jnp.asarray(value, dtype=jnp.bfloat16, device=device)
+        else:
+            value = jnp.asarray(value, device=device)
+        return variable.replace(value)
+
+    state = state.map(lambda _path, variable: _leaf(variable))
+    model = nnx.merge(graphdef, state)
+    model.eval()
+    jax.block_until_ready(nnx.state(model))
+    return model
+
+
+def _batch_input(value):
+    """Host 数组加 batch 维。关闭 x64 时 JAX 会把 float64 收成 float32，这里显式指定，避免统计量把 state 留在 float64。"""
+    if value is None or not hasattr(value, "dtype"):
+        return value
+    array = np.asarray(value)
+    if np.issubdtype(array.dtype, np.floating):
+        array = array.astype(np.float32, copy=False)
+    return jnp.asarray(array)[np.newaxis, ...]
+
+
 class InferenceServer:
     def __init__(self, model_config_path: str, checkpoint: str = None, prompt: str = "", seed: int = 42):
         if not prompt or not prompt.strip():
@@ -174,9 +242,22 @@ class InferenceServer:
             self.config = yaml.safe_load(stream)
 
         loaded = load_pi05_model(config_name="pi05_realrobot", checkpoint_dir=checkpoint, seed=seed)
-        self.model = loaded.model
+        device = _inference_device()
+        before_numpy, before_device, before_dtypes = _storage_summary(loaded.model)
+        self.model = _place_inference_params(loaded.model, device)
+        _, _, after_dtypes = _storage_summary(self.model)
         self._sample_actions = module_jit(self.model.sample_actions)
         self._rng = jax.random.key(seed)
+        print(
+            f"[policy_server] params host_leaves={before_numpy} device_leaves={before_device} "
+            f"dtypes {before_dtypes} -> {after_dtypes} on {device}",
+            flush=True,
+        )
+        if device.platform == "cpu":
+            print(
+                "[policy_server] 当前 JAX 没有 GPU，π0.5 会在 CPU 上跑，每次采样仍会远慢于官方 GPU 推理。",
+                flush=True,
+            )
 
         train_config = _train_config.get_config("pi05_realrobot")
         data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
@@ -215,6 +296,33 @@ class InferenceServer:
             f"prompt={self.prompt!r}"
         )
         self.preview = None  # optional CameraPreview instance, set by main() if --preview is used
+        self._warmup()
+
+    def _to_observation(self, transformed: dict) -> HistAugObservation:
+        return HistAugObservation.from_dict(jax.tree.map(_batch_input, transformed))
+
+    def _warmup(self) -> None:
+        """启动时编译并再跑一次。第一条机器人请求不应承担整网 XLA 编译。"""
+        print("[policy_server] compiling sample_actions...", flush=True)
+        image = np.zeros((224, 224, 3), dtype=np.uint8)
+        state = np.zeros((self.obs_dim,), dtype=np.float32)
+        times = []
+        for _ in range(2):
+            transformed = self._input_transform({
+                "observation/image": image,
+                "observation/state": state,
+                "prompt": self.prompt,
+            })
+            observation = self._to_observation(transformed)
+            self._rng, sample_rng = jax.random.split(self._rng)
+            start = perf_counter()
+            actions = self._sample_actions(sample_rng, observation)
+            jax.block_until_ready(actions)
+            times.append(perf_counter() - start)
+        print(
+            f"[policy_server] warmup compile {times[0]:.3f}s, steady {times[1]:.3f}s",
+            flush=True,
+        )
 
     @property
     def contract(self):
@@ -274,13 +382,12 @@ class InferenceServer:
             "observation/state": state,
             "prompt": self.prompt,
         })
-        observation = HistAugObservation.from_dict(
-            jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], transformed)
-        )
+        # 反归一化用的是变换后的 state。mask 全 False，数值不参与动作还原，不必再从设备上读回来。
+        state_out = np.asarray(transformed["state"])
+        observation = self._to_observation(transformed)
         self._rng, sample_rng = jax.random.split(self._rng)
         actions = self._sample_actions(sample_rng, observation)
         actions = np.asarray(jax.device_get(actions))[0]
-        state_out = np.asarray(jax.device_get(observation.state))[0]
         action = np.asarray(
             self._output_transform({"state": state_out, "actions": actions})["actions"],
             dtype="<f4",
