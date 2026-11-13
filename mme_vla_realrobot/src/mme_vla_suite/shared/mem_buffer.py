@@ -162,19 +162,23 @@ class MemoryBuffer:
         states, #: (t d), np.float32
         step_idx_list: list[int],
         exec_start_idx: int = 0,   # 只有 EventGraph 子类用（§5.1 阶段分界）；基类忽略
+        precomputed_emb=None,      # (t, v, p, d)，与 vision_enc 输出同形。传入则不再跑 SigLIP。
     ):
         assert self.vision_enc is not None, "encode is not initialized"
 
         t, v, _, _, _ = images.shape
         assert v == self.num_views
 
-        image_jnp = jnp.array(
-            images.astype(np.float32) / 255.0 * 2.0 - 1.0
-        )
-        image_jnp = einops.rearrange(image_jnp, "t v h w c -> (t v) h w c")
-        image_jnp = image_tools.resize_with_pad(image_jnp, 224, 224)
-        image_jnp = einops.rearrange(image_jnp, "(t v) h w c -> t v h w c", t=t, v=v)
-        output_emb = self.vision_enc(image_jnp)  # (t, v, 64, 2048)
+        if precomputed_emb is None:
+            image_jnp = jnp.array(
+                images.astype(np.float32) / 255.0 * 2.0 - 1.0
+            )
+            image_jnp = einops.rearrange(image_jnp, "t v h w c -> (t v) h w c")
+            image_jnp = image_tools.resize_with_pad(image_jnp, 224, 224)
+            image_jnp = einops.rearrange(image_jnp, "(t v) h w c -> t v h w c", t=t, v=v)
+            output_emb = self.vision_enc(image_jnp)  # (t, v, p, 2048)
+        else:
+            output_emb = precomputed_emb
         
         pooled_emb_8x8 = pool_tokens_to_size(output_emb, 64)  # (t, v, 64, 2048)
         pooled_emb_4x4 = pool_tokens_to_size(output_emb, 16)  # (t, v, 16, 2048)

@@ -93,7 +93,7 @@ class EventGraphMemoryBuffer(MemoryBuffer):
         self._arrival = 0
 
     # ── 喂帧 ───────────────────────────────────────────────────────────
-    def add_buffer(self, images, states, step_idx_list, exec_start_idx=None):
+    def add_buffer(self, images, states, step_idx_list, exec_start_idx=None, precomputed_emb=None):
         """与基类同名同形，只是多一步「顺手把图往前推一格」。
 
         exec_start_idx 在**这一批帧入图之前**更新：评测协议是第一批就把整段
@@ -101,7 +101,7 @@ class EventGraphMemoryBuffer(MemoryBuffer):
         """
         if exec_start_idx is not None and int(exec_start_idx) > 0:
             self.exec_start_idx = int(exec_start_idx)
-        super().add_buffer(images, states, step_idx_list)
+        super().add_buffer(images, states, step_idx_list, precomputed_emb=precomputed_emb)
         for s in step_idx_list:
             self._ingest(int(s))
 

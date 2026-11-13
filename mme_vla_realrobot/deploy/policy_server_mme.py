@@ -20,10 +20,11 @@ Inference request (binary):
         [stereo_jpeg, state, left_tactile, right_tactile],
     )
 
-``stereo_jpeg`` is a side-by-side BGR image as produced by OpenCV.  Pure π0.5
-uses only the left half as the head camera (``base_0_rgb``).  ``state`` is the
-42-D Astribot joint vector used by ``pi05_realrobot``.  ``--prompt`` is the
-language instruction tokenized into that observation.
+``stereo_jpeg`` is the head-camera BGR image as produced by OpenCV.  This server
+runs perceptual-eventgraph-expert_v2: the frame is encoded once with SigLIP and
+that token is reused both as Event-Graph memory and as the π0.5 prefix.
+``state`` is the 42-D Astribot joint vector.  ``--prompt`` is the language
+instruction tokenized into that observation.
 
 Response (binary):
     pack_frame({"shape": [action_horizon, action_dim], "buffers": [n]},
@@ -70,7 +71,7 @@ for _path in (_SRC_ROOT, _CODEBASE_ROOT):
     if _path not in sys.path:
         sys.path.insert(0, _path)
 from utils.camera_preview import CameraPreview
-from load_pi05 import load_pi05_model
+from load_eventgraph import load_eventgraph_model
 import mme_vla_suite.training.config as _train_config
 from mme_vla_suite.models.integration.history_observation import HistAugObservation
 
@@ -165,8 +166,8 @@ def _load_norm_stats(checkpoint: str | None, data_config):
                 return stats
     if data_config.norm_stats is None:
         raise FileNotFoundError(
-            "找不到 pi05 的 norm stats。请把 --checkpoint 指到含 assets/ 的 <step>，"
-            "或准备 runs/assets/pi05_realrobot/realrobot/norm_stats.json。"
+            "找不到 norm stats。请把 --checkpoint 指到含 assets/ 的 <step>，"
+            "或准备 runs/assets/mme_vla_realrobot/realrobot/norm_stats.json。"
         )
     return data_config.norm_stats
 
@@ -201,7 +202,7 @@ def _storage_summary(model) -> tuple[int, int, dict[str, int]]:
 def _place_inference_params(model, device):
     """把权重放到推理设备，浮点参数统一成 bfloat16。
 
-    ``load_pi05_model`` 沿用训练初始化：权重是 numpy，并且只把 ``.*img.*`` 转成
+    ``load_eventgraph_model`` 沿用训练初始化：权重是 numpy，并且只把 ``.*img.*`` 转成
     bfloat16。``module_jit`` 每次调用都会把这份 state 传进 ``jax.jit``。numpy
     数组每次都会整模从 CPU 拷到 GPU（几千个小数组，float32 时约十 GB），所以
     稳态也会落在 1 秒左右。官方 ``create_trained_policy`` 在 restore 时就用
@@ -238,19 +239,35 @@ def _batch_input(value):
     return jnp.asarray(array)[np.newaxis, ...]
 
 
+_HISTORY_CONFIG = "perceptual-eventgraph-expert_v2_realrobot.yaml"
+
+
 class InferenceServer:
-    def __init__(self, checkpoint: str = None, prompt: str = "", seed: int = 42):
+    def __init__(
+        self,
+        checkpoint: str = None,
+        prompt: str = "",
+        seed: int = 42,
+        history_config: str = _HISTORY_CONFIG,
+    ):
         if not prompt or not prompt.strip():
             raise ValueError("π0.5 需要语言指令，请通过 --prompt 传入。")
         self.prompt = prompt.strip()
 
-        loaded = load_pi05_model(config_name="pi05_realrobot", checkpoint_dir=checkpoint, seed=seed)
+        loaded = load_eventgraph_model(
+            history_config=history_config,
+            config_name="mme_vla_realrobot",
+            checkpoint_dir=checkpoint,
+            seed=seed,
+        )
         device = _inference_device()
         before_numpy, before_device, before_dtypes = _storage_summary(loaded.model)
         self.model = _place_inference_params(loaded.model, device)
         _, _, after_dtypes = _storage_summary(self.model)
         self._sample_actions = module_jit(self.model.sample_actions)
+        self._vision_encode = module_jit(self.model.vision_encode)
         self._rng = jax.random.key(seed)
+        self._seed = seed
         print(
             f"[policy_server] params host_leaves={before_numpy} device_leaves={before_device} "
             f"dtypes {before_dtypes} -> {after_dtypes} on {device}",
@@ -262,7 +279,7 @@ class InferenceServer:
                 flush=True,
             )
 
-        train_config = _train_config.get_config("pi05_realrobot")
+        train_config = _train_config.get_config("mme_vla_realrobot")
         data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
         norm_stats = _load_norm_stats(checkpoint, data_config)
         # 与 MME_VLA_Policy.infer 相同：RealRobotInputs → 归一化 → resize / tokenize prompt / pad。
@@ -309,13 +326,98 @@ class InferenceServer:
         # multiple sockets, but concurrent calls into one model can cause large
         # latency/memory spikes and offers no batching benefit here.
         self.inference_lock = asyncio.Lock()
+        self._state_norm = norm_stats["state"]
+        self._use_quantiles = bool(data_config.use_quantile_norm)
+        self._open_buffer()
         print(
-            f"[policy_server] loaded pi05; "
+            f"[policy_server] loaded eventgraph; "
             f"chunk={self.chunk_size}, obs_dim={self.obs_dim}, action_dim={self.action_dim}, "
-            f"prompt={self.prompt!r}"
+            f"history_config={history_config!r}, prompt={self.prompt!r}"
         )
         self.preview = None  # optional CameraPreview instance, set by main() if --preview is used
         self._warmup()
+
+    def _normalize_state(self, state):
+        stats = self._state_norm
+        if self._use_quantiles:
+            return (state - stats.q01) / (stats.q99 - stats.q01 + 1e-6) * 2.0 - 1.0
+        return (state - stats.mean) / (stats.std + 1e-6)
+
+    def _open_buffer(self) -> None:
+        """新建一条空的 Event-Graph 在线缓冲。预热帧不留在正式会话里。"""
+        from mme_vla_suite.models.representation.event_graph.config import GraphMemoryConfig
+        from mme_vla_suite.models.representation.event_graph.frame_summary import (
+            FrozenFrameSummary,
+        )
+        from mme_vla_suite.models.representation.event_graph.online import (
+            EventGraphMemoryBuffer,
+        )
+
+        history = self.model.history_config
+        cfg = GraphMemoryConfig.from_history_config(history)
+        if cfg.token_per_image != 16:
+            raise ValueError(
+                f"event_graph 在线推理要求 token_per_image=16，得到 {cfg.token_per_image}。"
+            )
+        pca = FrozenFrameSummary.load(cfg.resolve_pca_path())
+        feature = history.memory_feature
+        self.mem_buffer = EventGraphMemoryBuffer(
+            cfg,
+            pca,
+            dims=(
+                int(feature.img.input_dim),
+                int(feature.pos.input_dim),
+                int(feature.state.input_dim),
+            ),
+            normalize_state=self._normalize_state,
+            num_views=history.num_views,
+            img_emb_dim=int(feature.img.input_dim),
+            pos_emb_dim=int(feature.pos.input_dim),
+            state_emb_dim=int(feature.state.input_dim),
+            vision_enc_fn=self._vision_encode,
+        )
+        self._step = 0
+
+    def _encode_prefix(self, rgb: np.ndarray):
+        """把已经 resize 过的头图编一次 SigLIP。返回 (1, 1, tokens, dim)。"""
+        array = np.asarray(rgb)
+        if array.dtype == np.uint8:
+            array = array.astype(np.float32) / 255.0 * 2.0 - 1.0
+        else:
+            array = np.asarray(array, dtype=np.float32)
+        return self._vision_encode(jnp.asarray(array)[None, None])
+
+    def _push_memory(self, rgb: np.ndarray, raw_state: np.ndarray, emb) -> None:
+        pixels = np.asarray(rgb)
+        if pixels.dtype != np.uint8:
+            pixels = np.clip(np.rint((pixels.astype(np.float32) + 1.0) * 127.5), 0, 255).astype(np.uint8)
+        self.mem_buffer.add_buffer(
+            pixels[None, None],
+            np.asarray(raw_state, dtype=np.float32).reshape(1, -1),
+            [self._step],
+            precomputed_emb=emb,
+        )
+        self._step += 1
+
+    def _sample(self, head_rgb: np.ndarray, raw_state: np.ndarray):
+        transformed = self._input_transform({
+            "observation/image": head_rgb,
+            "observation/state": raw_state,
+            "prompt": self.prompt,
+        })
+        state_out = np.asarray(transformed["state"])
+        rgb = transformed["image"]["base_0_rgb"]
+        emb = self._encode_prefix(rgb)
+        self._push_memory(rgb, raw_state, emb)
+        transformed.update(self.mem_buffer.memory())
+        observation = self._to_observation(transformed)
+        self._rng, sample_rng = jax.random.split(self._rng)
+        actions = self._sample_actions(
+            sample_rng,
+            observation,
+            prefix_image_tokens={"base_0_rgb": emb[:, 0]},
+        )
+        return actions, state_out
 
     def _to_observation(self, transformed: dict) -> HistAugObservation:
         return HistAugObservation.from_dict(jax.tree.map(_batch_input, transformed))
@@ -327,17 +429,12 @@ class InferenceServer:
         state = np.zeros((self.obs_dim,), dtype=np.float32)
         times = []
         for _ in range(2):
-            transformed = self._input_transform({
-                "observation/image": image,
-                "observation/state": state,
-                "prompt": self.prompt,
-            })
-            observation = self._to_observation(transformed)
-            self._rng, sample_rng = jax.random.split(self._rng)
             start = perf_counter()
-            actions = self._sample_actions(sample_rng, observation)
+            actions, _ = self._sample(image, state)
             jax.block_until_ready(actions)
             times.append(perf_counter() - start)
+        self._open_buffer()
+        self._rng = jax.random.key(self._seed)
         print(
             f"[policy_server] warmup compile {times[0]:.3f}s, steady {times[1]:.3f}s",
             flush=True,
@@ -403,17 +500,8 @@ class InferenceServer:
         if self.preview is not None:
             self.preview.update(head_bgr)
 
-        # --prompt 在这里 tokenize，并和图像、state 组成 sample_actions 的 observation。
-        transformed = self._input_transform({
-            "observation/image": head,
-            "observation/state": state,
-            "prompt": self.prompt,
-        })
-        # 反归一化用的是变换后的 state。mask 全 False，数值不参与动作还原，不必再从设备上读回来。
-        state_out = np.asarray(transformed["state"])
-        observation = self._to_observation(transformed)
-        self._rng, sample_rng = jax.random.split(self._rng)
-        actions = self._sample_actions(sample_rng, observation)
+        # 当前帧只编码一次：SigLIP token 同时写入记忆，并作为前缀，不再进 sample_actions 里重算。
+        actions, state_out = self._sample(head, state)
         actions = np.asarray(jax.device_get(actions))[0]
         action = np.asarray(
             self._output_transform({"state": state_out, "actions": actions})["actions"],
@@ -476,7 +564,12 @@ async def handle_connection(websocket, core: InferenceServer):
 
 
 async def main(args):
-    core = InferenceServer(checkpoint=args.checkpoint, prompt=args.prompt)
+    core = InferenceServer(
+        checkpoint=args.checkpoint,
+        prompt=args.prompt,
+        history_config=args.history_config,
+        seed=args.seed,
+    )
     preview_task = None
     if args.preview:
         core.preview = CameraPreview(label="deco_task7_stage1")
@@ -507,7 +600,9 @@ async def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="DECO WebSocket policy server")
     parser.add_argument("--model-config", default="")
-    parser.add_argument("--checkpoint", type=str, default="/home/zy/zhihao/Event-Graph-VLA/mme_vla_realrobot/runs/ckpts/pi05_realrobot/pi05_yu/39999", help="Stage1 checkpoint path")
+    parser.add_argument("--checkpoint", type=str, default="/home/zy/zhihao/Event-Graph-VLA/mme_vla_realrobot/runs/ckpts/pi05_realrobot/pi05_yu/39999", help="微调目录：<step> 或 <step>/params")
+    parser.add_argument("--history-config", default=_HISTORY_CONFIG, help="Event-Graph yaml，默认真机 perceptual-eventgraph-expert_v2")
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--max-message-mb", type=int, default=20)

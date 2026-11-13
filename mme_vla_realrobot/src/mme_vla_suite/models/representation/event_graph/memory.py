@@ -145,7 +145,7 @@ class EventEncoder(nnx.Module):
         self.gru = _GRUCell(d, rngs, dtype)
         self.out_norm = nnx.LayerNorm(d, rngs=rngs, dtype=dtype)
 
-    def __call__(self, tokens, frame_mask, state, node_mask, task_vec):
+    def __call__(self, tokens, frame_mask, state, node_mask, task_vec, *, train: bool = True):
         """
         tokens      [B, N, L, P, Dt]  该帧的 16 个 512-d PCA token
         frame_mask  [B, N, L]         哪些采样帧是真实存在的
@@ -153,22 +153,25 @@ class EventEncoder(nnx.Module):
         node_mask   [B, N]            哪些槽位是真实节点
         task_vec    [B, W]            指令向量
         返回 h_event [B, N, d]
+
+        train=True 时计算用 float32：fp16 会把训练早期约 1e-10 的梯度冲成 0。
+        train=False（sample_actions）时用 bfloat16，和部署权重的 dtype 一致。
         """
         B, N, L, P, _ = tokens.shape
         d, H, dh = self.d, self.heads, self.head_dim
-        f32 = jnp.float32
+        compute = jnp.float32 if train else jnp.bfloat16
 
-        # ⚠️ 先把 fp16 的输入升到 f32 再算，别让任何内部激活落在 fp16 上。
+        # ⚠️ 训练先把 fp16 的输入升到 f32 再算，别让任何内部激活落在 fp16 上。
         #    磁盘上的 512-d 冻结 token 存成 fp16 是为了省带宽，但**计算**留在 fp16
         #    会在反向时把小的梯度冲成精确的 0：fp16 的最小次正规数是 6e-8，初始化
         #    阶段回传到这里的梯度只有 ~1e-10（24 槽读取器接近饱和 + slot 残差零初始化
         #    ⇒ 整支记忆的梯度本来就小）。实测现象是「GNN 的参数（bf16，次正规到 9e-41）
         #    有梯度、encoder 的参数全是精确 0」—— 梯度没断，是被 fp16 吃掉了。
-        tokens = tokens.astype(f32)
-        state = state.astype(f32)
+        tokens = tokens.astype(compute)
+        state = state.astype(compute)
 
         # ── v_pool：指令当 Q，每帧的 P 个 token 当 K/V（L 帧共用同一套投影）──
-        q = einops.rearrange(self.q_proj(task_vec).astype(f32), "b (h d) -> b h d", h=H)
+        q = einops.rearrange(self.q_proj(task_vec).astype(compute), "b (h d) -> b h d", h=H)
         k = einops.rearrange(self.k_proj(tokens), "b n l p (h d) -> b h n l p d", h=H)
         v = einops.rearrange(self.v_proj(tokens), "b n l p (h d) -> b h n l p d", h=H)
 
@@ -189,10 +192,10 @@ class EventEncoder(nnx.Module):
         # ── 帧级融合：拼上该帧 state ──
         st = nnx.silu(self.state_proj(state))                       # [B,N,L,S] -> [B,N,L,d]
         x = self.frame_norm(self.frame_proj(jnp.concatenate([pooled, st], axis=-1)))
-        x = x.astype(f32) * frame_mask[..., None]                   # padding 帧清零
+        x = x.astype(compute) * frame_mask[..., None]               # padding 帧清零
 
         # ── Event GRU：按时间顺序吃 L 帧，无效帧不推进状态 ──
-        h = jnp.zeros((B, N, d), f32)
+        h = jnp.zeros((B, N, d), compute)
         for l in range(L):
             new_h = self.gru(h, x[:, :, l, :])
             keep = frame_mask[:, :, l, None]
@@ -252,7 +255,7 @@ class RelationalLayer(nnx.Module):
     def _split(x, heads):
         return einops.rearrange(x, "b n (h d) -> b h n d", h=heads)
 
-    def __call__(self, h, task_vec, adj, edge_attr, node_mask):
+    def __call__(self, h, task_vec, adj, edge_attr, node_mask, *, train: bool = True):
         """
         h         [B, N, d]
         task_vec  [B, W]
@@ -260,19 +263,20 @@ class RelationalLayer(nnx.Module):
         edge_attr [B, N, N, E]
         node_mask [B, N]
         """
-        f32 = jnp.float32
+        # 训练用 float32，理由同 EventEncoder。推理走 bfloat16。
+        compute = jnp.float32 if train else jnp.bfloat16
         H = self.heads
         instr = task_vec[:, None, :]                                  # [B,1,W] 广播到所有节点
         messages = []
         for r in range(N_RELATIONS):
             key = f"r{r}"
-            q = self._split(self.wq[key](h) + self.w_task[key](instr), H).astype(f32)
-            k = self._split(self.wk[key](h), H).astype(f32)
+            q = self._split(self.wq[key](h) + self.w_task[key](instr), H).astype(compute)
+            k = self._split(self.wk[key](h), H).astype(compute)
             v = self._split(self.wv[key](h), H)
 
             logits = jnp.einsum("bhnd,bhmd->bhnm", q, k) / math.sqrt(self.head_dim)
             bias = einops.rearrange(self.edge_mlp[key](edge_attr), "b n m h -> b h n m")
-            logits = logits + bias.astype(f32)
+            logits = logits + bias.astype(compute)
 
             # adj 是 [B,N,N]，广播到每个头
             alpha = _masked_softmax(logits, adj[:, r][:, None, :, :]) # [B,H,N,N]
@@ -386,7 +390,7 @@ class EventGraphMemory(nnx.Module):
                  node_mass, node_bstr, node_phase, node_grasp,
                  node_payload, node_payload_mask, node_payload_pos, node_payload_state,
                  recent_payload, recent_payload_pos, recent_payload_state, recent_mask,
-                 task_vec):
+                 task_vec, train: bool = True):
         """
         长期一侧
           node_tokens        [B,N,L,P,d]   从 512-d FP16 event cache 切出来的 L=8 帧
@@ -421,12 +425,14 @@ class EventGraphMemory(nnx.Module):
                 + self.grasp_proj(node_grasp[..., None])
                 + self.mass_proj(mass[..., None]))
         h0 = self.node_norm(self.node_in(scal)) * node_mask[..., None]
-        h = self.encoder(node_tokens, node_frame_mask, node_state, node_mask, task_vec) + h0
+        h = self.encoder(
+            node_tokens, node_frame_mask, node_state, node_mask, task_vec, train=train
+        ) + h0
 
         # ② relation-aware GNN
         adj, edge_attr = self._build_graph(h, node_mask, node_bstr)
         for layer in self.gnn.values():
-            h = layer(h, task_vec, adj, edge_attr, node_mask)
+            h = layer(h, task_vec, adj, edge_attr, node_mask, train=train)
 
         # ③ 一个节点一组 token：不再有跨节点的权重混合。
         #    没有 payload 的节点不能进来：它拿不出真实画面证据，铺进去等于凭空造帧。

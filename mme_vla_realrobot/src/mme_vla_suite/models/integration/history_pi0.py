@@ -519,7 +519,7 @@ class HistoryPi0(BaseModel):
         return task_vec
 
     @at.typecheck
-    def embed_memory(self, obs: HistAugObservation):
+    def embed_memory(self, obs: HistAugObservation, *, train: bool = True):
         if self.representation_type == "perceptual":
             if self.history_config.perceptual_memory.type == "graph_dpp":
                 task_vec = self._compute_task_vec(obs)
@@ -566,6 +566,7 @@ class HistoryPi0(BaseModel):
                     recent_payload_state=obs.eg_recent_payload_state,
                     recent_mask=obs.eg_recent_mask,
                     task_vec=task_vec,
+                    train=train,
                 )
                 # 与其它记忆类型共用同一条下游：FeatureEncoder 把 2048 投到
                 # memory_token_dim，mask 用长期+近期拼出来的那张（空图时长期段全屏蔽）。
@@ -589,7 +590,7 @@ class HistoryPi0(BaseModel):
 
     @at.typecheck
     def embed_prefix(
-        self, obs: HistAugObservation
+        self, obs: HistAugObservation, *, prefix_image_tokens: Any | None = None
     ) -> tuple[
         at.Float[at.Array, "b s emb"],
         at.Bool[at.Array, "b s"],
@@ -618,9 +619,13 @@ class HistoryPi0(BaseModel):
         else:
             stats = None
 
-        # embed images
+        # embed images。prefix_image_tokens 与 PaliGemma.img 同形 (b, s, emb)，
+        # 部署端把已经算过的 SigLIP token 传进来，避免当前帧再编码一次。
         for i, name in enumerate(obs.images):
-            image_tokens, _ = self.PaliGemma.img(obs.images[name], train=False)
+            if prefix_image_tokens is None:
+                image_tokens, _ = self.PaliGemma.img(obs.images[name], train=False)
+            else:
+                image_tokens = prefix_image_tokens[name]
 
             tokens.append(image_tokens)
             input_mask.append(
@@ -847,6 +852,7 @@ class HistoryPi0(BaseModel):
         *,
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
+        prefix_image_tokens: Any | None = None,
     ) -> Actions:
 
         observation = preprocess_observation(None, observation, train=False)
@@ -860,8 +866,12 @@ class HistoryPi0(BaseModel):
             )
 
         if self.integration_type == "expert":
-            mem_tokens, mem_input_mask, mem_ar_mask, mem_na_mask, _ = self.embed_memory(observation)
-            vlm_tokens, vlm_mask, vlm_ar_mask, vlm_na_mask, _ = self.embed_prefix(observation)
+            mem_tokens, mem_input_mask, mem_ar_mask, mem_na_mask, _ = self.embed_memory(
+                observation, train=False
+            )
+            vlm_tokens, vlm_mask, vlm_ar_mask, vlm_na_mask, _ = self.embed_prefix(
+                observation, prefix_image_tokens=prefix_image_tokens
+            )
             mem_ar_mask = jnp.array(mem_ar_mask)
             mem_na_mask = jnp.array(mem_na_mask)
             prefix_mask = jnp.concatenate([mem_input_mask, vlm_mask], axis=1)
@@ -878,16 +888,20 @@ class HistoryPi0(BaseModel):
             )
 
         elif self.integration_type == "modulation":
-            prefix_tokens, prefix_mask, prefix_ar_mask, _, _ = self.embed_prefix(observation)
+            prefix_tokens, prefix_mask, prefix_ar_mask, _, _ = self.embed_prefix(
+                observation, prefix_image_tokens=prefix_image_tokens
+            )
             prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
             positions = jnp.cumsum(prefix_mask, axis=1) - 1
             _, kv_cache = self.PaliGemma.llm(
                 [prefix_tokens, None], mask=prefix_attn_mask, positions=positions
             )
-            mem_seq, mem_mask, _, _, _ = self.embed_memory(observation)
+            mem_seq, mem_mask, _, _, _ = self.embed_memory(observation, train=False)
             
         else:
-            prefix_tokens, prefix_mask, prefix_ar_mask, prefix_na_mask, _ = self.embed_prefix(observation)
+            prefix_tokens, prefix_mask, prefix_ar_mask, prefix_na_mask, _ = self.embed_prefix(
+                observation, prefix_image_tokens=prefix_image_tokens
+            )
             if self.integration_type == "context":
                 prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask, prefix_na_mask)
             else:
